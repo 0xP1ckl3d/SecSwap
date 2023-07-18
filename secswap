@@ -1,0 +1,224 @@
+#! /bin/python3
+
+import os
+import argparse
+import requests
+from http.server import HTTPServer, BaseHTTPRequestHandler, SimpleHTTPRequestHandler
+import shutil
+import json
+import socket
+import base64
+from getpass import getpass
+from urllib.parse import unquote
+
+class CustomHTTPRequestHandler(SimpleHTTPRequestHandler):
+    server_password = None
+
+    def do_AUTHHEAD(self):
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Basic realm=\"Test\"')
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+
+    def check_auth(self):
+        if self.headers.get('Authorization') is None:
+            self.do_AUTHHEAD()
+            self.wfile.write(b'no auth header received')
+            return False
+
+        type, auth_string = self.headers.get('Authorization').split(' ')
+        if type != "Basic":
+            self.do_AUTHHEAD()
+            self.wfile.write(b'non-basic auth type not supported')
+            return False
+
+        auth_string = base64.b64decode(auth_string).decode('utf-8')
+        username, password = auth_string.split(':')
+        if password == self.server_password:
+            return True
+        else:
+            self.do_AUTHHEAD()
+            self.wfile.write(b'wrong password')
+            return False
+
+    def do_GET(self):
+        if not self.check_auth():  # Check the authentication
+            return  # If it fails, return immediately
+        try:
+            print(f"Received GET request for {self.path}")
+            if self.path == '/secswap':
+                self.send_response(200)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                with open(os.path.abspath(__file__), 'r') as f:
+                    content = f.read()
+                    print(f"Sending content with length {len(content)}")
+                    self.wfile.write(bytes(content, 'utf8'))
+            elif self.path.startswith('/ls'):
+                # Extract the subdirectory from the path
+                subdirectory = self.path[4:].strip('/')
+                # If no subdirectory was specified, use the current directory
+                subdirectory = '.' if subdirectory == '' else subdirectory
+                if not os.path.exists(subdirectory):
+                    self.send_error(404, f"Directory {subdirectory} does not exist.")
+                    return
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                dir_contents = [{'name': item, 'type': 'directory' if os.path.isdir(os.path.join(subdirectory, item)) else 'file'} for item in os.listdir(subdirectory)]
+                self.wfile.write(bytes(json.dumps(dir_contents), 'utf8'))
+            else:
+                return SimpleHTTPRequestHandler.do_GET(self)
+        except Exception as e:
+            print(f"Error processing GET request: {e}")
+
+    def do_POST(self):
+        try:
+            print(f"Received POST request")
+            if 'Content-Length' in self.headers:
+                length = int(self.headers['Content-Length'])
+                data = self.rfile.read(length)
+                filename = self.headers.get('filename', 'uploaded_file')
+                with open(f'./uploads/{filename}', 'wb') as f:
+                    f.write(data)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'File uploaded successfully')
+        except Exception as e:
+            print(f"Error processing POST request: {e}")
+
+def get_host_ip():
+    try:
+        return [l for l in (
+            [ip for ip in socket.gethostbyname_ex(socket.gethostname())[2] if not ip.startswith("127.")][:1],
+            [[(s.connect(('8.8.8.8', 53)), s.getsockname()[0], s.close()) for s in [socket.socket(socket.AF_INET, socket.SOCK_DGRAM)]][0][1]]
+        ) if l][0][0]
+    except (Exception, ):
+        return None
+
+def run(server_class=HTTPServer, handler_class=CustomHTTPRequestHandler, port=8080, directory=".", password=None):
+    os.chdir(directory)
+    server_address = ('0.0.0.0', port)
+    handler_class.server_password = password
+    httpd = server_class(server_address, handler_class)
+    print('WARNING: This is a development server. Do not use it in a production deployment.')
+    if os.path.exists(directory + '/uploads'):
+        print(f"Directory {directory + '/uploads'} already exists - file uploads will be placed here.")
+    else:
+        os.makedirs(directory + '/uploads')
+        print(f"Directory {directory + '/uploads'} created - file uploads will be placed here.")
+    print('*** SecSwap serving at:')
+    for ip in ['0.0.0.0', '127.0.0.1', get_host_ip()]:
+        if ip:
+            print(f'\t\thttp://{ip}:{port}/')
+    print('(Press CTRL+C to quit)')
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nTerminating server...")
+        httpd.server_close()
+
+def list_files(host, port, directory='.', password=None):
+    if password:
+        credentials = base64.b64encode(bytes(f":{password}", 'utf-8')).decode('utf-8')
+        headers = {'Authorization': f'Basic {credentials}'}
+    else:
+        headers = {}
+    if not host:
+        print('Error: No server specified.')
+        return
+    try:
+        url = f'http://{host}:{port}/ls/{directory}'
+        r = requests.get(url, headers=headers)
+        r.raise_for_status()
+        dir_contents = json.loads(r.text)
+        for item in dir_contents:
+            print(f"{item['name']}\t{item['type']}")
+    except requests.exceptions.RequestException as e:
+        print(f'Error connecting to server: {e}')
+
+
+def download_file(file_path, host, port, password=None):
+    if password:
+        credentials = base64.b64encode(bytes(f":{password}", 'utf-8')).decode('utf-8')
+        headers = {'Authorization': f'Basic {credentials}'}
+    else:
+        headers = {}
+    if not host:
+        print('Error: No server specified.')
+        return
+    try:
+        url = f'http://{host}:{port}/{file_path}'
+        r = requests.get(url, headers=headers, allow_redirects=True)
+        r.raise_for_status()
+
+        local_file_name = os.path.basename(unquote(file_path))  # Use only the base name of the file path
+
+        with open(local_file_name, 'wb') as f:
+            f.write(r.content)
+        
+        print(f'Downloaded {local_file_name}')
+    except requests.exceptions.RequestException as e:
+        print(f'Error connecting to server: {e}')
+        
+        
+def upload_file(file_path, host, port, password=None):
+    if password:
+        credentials = base64.b64encode(bytes(f":{password}", 'utf-8')).decode('utf-8')
+        headers = {'Authorization': f'Basic {credentials}'}
+    else:
+        headers = {'filename': os.path.basename(file_path)}
+    if not host:
+        print('Error: No server specified.')
+        return
+    try:
+        url = f'http://{host}:{port}'
+        headers = {'filename': os.path.basename(file_path)}
+        with open(file_path, 'rb') as f:
+            requests.post(url, data=f.read(), headers=headers)
+        print(f'Uploaded {file_path}')
+    except requests.exceptions.RequestException as e:
+        print(f'Error connecting to server: {e}')
+    
+def main():
+    parser = argparse.ArgumentParser(description='SecSwap')
+    subparsers = parser.add_subparsers(help='client or server', dest='role')
+
+    server_parser = subparsers.add_parser('server', help='SecSwap server')
+    server_parser.add_argument('-p', '--port', type=int, default=8080, help='Port to listen on (default 8080)')
+    server_parser.add_argument('-d', '--dir', default=os.getcwd(), help='Directory to serve (default current)')
+    server_parser.add_argument('-a', '--auth', action='store_true', help='Prompt for password for authentication')
+
+    client_parser = subparsers.add_parser('client', help='SecSwap client')
+    client_parser.add_argument('-s', '--server', help='Host to download from or upload to')
+    client_parser.add_argument('-p', '--port', type=int, default=8080, help='Port to connect to')
+    client_parser.add_argument('-u', '--upload', help='File to upload')
+    client_parser.add_argument('-d', '--download', help='File to download (file name or path)')
+    client_parser.add_argument('-ls', '--list', nargs='?', const='.', default=argparse.SUPPRESS, 
+                               help='List all files and directories on the host (optional directory)')
+    client_parser.add_argument('-a', '--auth', action='store_true', help='Prompt for password for authentication')
+
+    args = parser.parse_args()
+
+    # Check if the 'auth' attribute exists
+    password = getpass() if 'auth' in args and args.auth else None
+
+    if args.role == 'server':
+        run(port=args.port, directory=args.dir, password=password)
+    elif args.role == 'client':
+        if not args.server:
+            print('Error: No server specified.')
+        else:
+            if args.upload:
+                upload_file(args.upload, args.server, args.port, password)
+            elif args.download:
+                download_file(args.download, args.server, args.port, password)
+            elif 'list' in args:
+                list_files(args.server, args.port, args.list, password)
+            else:
+                print("Please select 'server' or 'client'. Use '-h' for more information.")
+    else:
+        print("Please select 'server' or 'client'. Use '-h' for more information.")
+
+if __name__ == "__main__":
+    main()
